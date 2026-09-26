@@ -8,9 +8,9 @@ if (-not (Test-Path "venv")) {
 }
 
 & ".\venv\Scripts\python.exe" -m pip install --upgrade pip
-& ".\venv\Scripts\python.exe" -m pip install -r requirements.txt
+& ".\venv\Scripts\python.exe" -m pip install --upgrade -r requirements.txt
 
-& ".\venv\Scripts\pyinstaller.exe" `
+& ".\venv\Scripts\python.exe" -m PyInstaller `
     --noconfirm `
     --onefile `
     --windowed `
@@ -19,6 +19,7 @@ if (-not (Test-Path "venv")) {
     --add-data "assets;assets" `
     --collect-all imageio_ffmpeg `
     --collect-all yt_dlp `
+    --collect-all yt_dlp_ejs `
     app.py
 
 Write-Host ""

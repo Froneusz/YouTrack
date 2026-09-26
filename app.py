@@ -10,9 +10,11 @@ Bezpieczeństwo / dlaczego tak, a nie gotowy "yt2mp3.exe" z internetu:
   nie ma pobierania "instalatorów", nie ma telemetrii.
 """
 
+import json
 import os
 import sys
 import threading
+import time
 import queue
 import subprocess
 from pathlib import Path
@@ -21,6 +23,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import yt_dlp
+from yt_dlp.extractor.youtube import YoutubeIE
+from yt_dlp.postprocessor.common import PostProcessor
 import imageio_ffmpeg
 
 from theme import apply_theme, style_text_widget
@@ -29,6 +33,86 @@ APP_TITLE = "YouTrak"
 DEFAULT_OUTPUT_DIR = str(Path.home() / "Music" / "YouTrak")
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "icon.ico"
 LOGO_PATH = Path(__file__).resolve().parent / "assets" / "icon.png"
+CONFIG_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "YouTrak" / "config.json"
+COOKIE_BROWSERS = ["brak", "firefox", "chrome", "edge", "brave", "opera", "vivaldi"]
+# Kolejne zestawy klientów YouTube próbowane, gdy YouTube blokuje pobieranie (weryfikacja "bot",
+# HTTP 403 na strumieniu bez PO Tokena, brak formatów przez SABR). None = domyślny wybór yt-dlp.
+# web_embedded (odtwarzacz osadzony) zwykle nie wymaga PO Tokena ani logowania.
+FALLBACK_PLAYER_CLIENTS = [None, ["web_embedded"], ["tv", "web_safari"], ["mweb"]]
+RETRYABLE_ERRORS = (
+    "not a bot",
+    "HTTP Error 403",
+    "Requested format is not available",
+    "page needs to be reloaded",
+)
+
+BOT_CHECK_HINT = (
+    "YouTube zablokował anonimowe pobieranie z Twojego IP "
+    "(weryfikacja \"nie jestem botem\").\n\n"
+    "Rozwiązanie: wskaż plik cookies.txt wyeksportowany z przeglądarki, w której jesteś "
+    "zalogowany do YouTube (np. rozszerzeniem \"Get cookies.txt LOCALLY\"), "
+    "albo wybierz Firefoksa jako źródło cookies.\n\n"
+    "Chrome/Edge na Windows szyfrują cookies (App-Bound Encryption) i blokują bazę, "
+    "gdy są uruchomione - dlatego plik cookies.txt jest najpewniejszy."
+)
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+ARCHIVE_NAME = ".youtrak_archive.json"
+
+
+class DownloadArchive:
+    """Rejestr pobranych utworów w folderze docelowym: {video_id: {"title", "file"}}.
+
+    Utwór uznajemy za pobrany, dopóki jego plik MP3 nadal istnieje - usunięcie pliku
+    pozwala pobrać go ponownie.
+    """
+
+    def __init__(self, out_dir: Path):
+        self.path = out_dir / ARCHIVE_NAME
+        try:
+            self.entries = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.entries = {}
+
+    def find(self, video_id: str):
+        entry = self.entries.get(video_id)
+        if entry and Path(entry["file"]).is_file():
+            return entry
+        return None
+
+    def add(self, video_id: str, title: str, file: str) -> None:
+        self.entries[video_id] = {"title": title, "file": file}
+        try:
+            self.path.write_text(json.dumps(self.entries, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+
+class _ArchivePP(PostProcessor):
+    """Po zapisaniu gotowego MP3 dopisuje utwór do archiwum."""
+
+    def __init__(self, archive: DownloadArchive):
+        super().__init__()
+        self._archive = archive
+
+    def run(self, info):
+        self._archive.add(info["id"], info.get("title", info["id"]), info["filepath"])
+        return [], info
 
 
 def get_ffmpeg_path() -> str:
@@ -40,7 +124,7 @@ class DownloaderApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("680x560")
+        self.root.geometry("680x640")
         self.root.minsize(580, 460)
         apply_theme(self.root)
         self._set_window_icon()
@@ -50,6 +134,9 @@ class DownloaderApp:
         self.url_var = tk.StringVar()
         self.quality_var = tk.StringVar(value="320")
         self.playlist_var = tk.BooleanVar(value=False)
+        cfg = load_config()
+        self.cookie_file_var = tk.StringVar(value=cfg.get("cookie_file", ""))
+        self.cookie_browser_var = tk.StringVar(value=cfg.get("cookie_browser", "brak"))
         self.is_downloading = False
 
         self._build_ui()
@@ -108,6 +195,28 @@ class DownloaderApp:
             row=1, column=1
         )
 
+        cookies = ttk.Frame(outer)
+        cookies.pack(fill="x", pady=(16, 0))
+        cookies.columnconfigure(0, weight=1)
+        ttk.Label(
+            cookies,
+            text="COOKIES YOUTUBE (gdy YouTube żąda logowania)",
+            style="Section.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Entry(cookies, textvariable=self.cookie_file_var).grid(
+            row=1, column=0, sticky="ew", ipady=4, padx=(0, 8)
+        )
+        ttk.Button(cookies, text="cookies.txt...", command=self._choose_cookie_file).grid(
+            row=1, column=1, padx=(0, 8)
+        )
+        ttk.Combobox(
+            cookies,
+            textvariable=self.cookie_browser_var,
+            values=COOKIE_BROWSERS,
+            width=9,
+            state="readonly",
+        ).grid(row=1, column=2)
+
         row2 = ttk.Frame(outer)
         row2.pack(fill="x", pady=(16, 0))
 
@@ -163,6 +272,14 @@ class DownloaderApp:
         if chosen:
             self.output_dir.set(chosen)
 
+    def _choose_cookie_file(self):
+        chosen = filedialog.askopenfilename(
+            title="Wybierz plik cookies.txt (format Netscape)",
+            filetypes=[("Cookies", "*.txt"), ("Wszystkie pliki", "*.*")],
+        )
+        if chosen:
+            self.cookie_file_var.set(chosen)
+
     def _open_output_dir(self):
         path = Path(self.output_dir.get())
         path.mkdir(parents=True, exist_ok=True)
@@ -202,6 +319,24 @@ class DownloaderApp:
             messagebox.showerror(APP_TITLE, f"Nie można utworzyć folderu:\n{exc}")
             return
 
+        cookie_file = self.cookie_file_var.get().strip()
+        if cookie_file and not Path(cookie_file).is_file():
+            messagebox.showerror(APP_TITLE, f"Plik cookies nie istnieje:\n{cookie_file}")
+            return
+        save_config({"cookie_file": cookie_file, "cookie_browser": self.cookie_browser_var.get()})
+
+        # szybkie sprawdzenie pojedynczego utworu bez łączenia się z YouTube
+        video_id = YoutubeIE.get_temp_id(url)
+        if video_id and not self.playlist_var.get():
+            entry = DownloadArchive(out_dir).find(video_id)
+            if entry:
+                self.log(f"Pominięto - już pobrane: {entry['title']}")
+                messagebox.showinfo(
+                    APP_TITLE,
+                    f"Ta piosenka jest już pobrana:\n\n{entry['title']}\n\n{entry['file']}",
+                )
+                return
+
         self.is_downloading = True
         self.download_btn.configure(state="disabled", text="Pobieranie...")
         self.progress["value"] = 0
@@ -240,16 +375,85 @@ class DownloaderApp:
             "quiet": True,
             "no_warnings": True,
             "logger": _YdlLogger(self.log),
+            # łagodniej dla limitów YouTube (HTTP 429), szczególnie przy playlistach
+            "sleep_interval_requests": 1,
+            "sleep_interval": 2,
+            "max_sleep_interval": 5,
         }
+
+        cookie_file = self.cookie_file_var.get().strip()
+        cookie_browser = self.cookie_browser_var.get()
+        if cookie_file:
+            ydl_opts["cookiefile"] = cookie_file
+        elif cookie_browser and cookie_browser != "brak":
+            ydl_opts["cookiesfrombrowser"] = (cookie_browser, None, None, None)
+
+        archive = DownloadArchive(out_dir)
+        skipped: dict = {}
+        downloaded: list = []
+
+        def match_filter(info, *, incomplete=False):
+            video_id = info.get("id")
+            title = info.get("title") or video_id
+            entry = archive.find(video_id) if video_id else None
+            if entry is None and not incomplete and ydl_ref:
+                # plik mógł zostać pobrany wcześniej, zanim istniało archiwum
+                target = Path(ydl_ref[0].prepare_filename(info)).with_suffix(".mp3")
+                if target.is_file():
+                    archive.add(video_id, title, str(target))
+                    entry = archive.find(video_id)
+            if entry:
+                if video_id not in skipped:
+                    skipped[video_id] = entry
+                    self.log(f"Pominięto - już pobrane: {entry['title']}")
+                return f"{title} jest już pobrane"
+            if not incomplete and video_id not in downloaded:
+                downloaded.append(video_id)
+            return None
+
+        ydl_opts["match_filter"] = match_filter
+        ydl_ref: list = []
 
         try:
             self.log(f"Start: {url}")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-            self.log("Gotowe! Plik(i) MP3 zapisane w: " + str(out_dir))
+            for attempt, clients in enumerate(FALLBACK_PLAYER_CLIENTS):
+                opts = dict(ydl_opts)
+                if clients:
+                    opts["extractor_args"] = {"youtube": {"player_client": clients}}
+                try:
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        ydl_ref[:] = [ydl]
+                        ydl.add_post_processor(_ArchivePP(archive), when="after_move")
+                        ydl.download([url])
+                    break
+                except yt_dlp.utils.DownloadError as exc:
+                    if not any(e in str(exc) for e in RETRYABLE_ERRORS) or attempt == len(FALLBACK_PLAYER_CLIENTS) - 1:
+                        raise
+                    self.log(f"YouTube zablokował strumień - ponawiam z klientami: {', '.join(FALLBACK_PLAYER_CLIENTS[attempt + 1])}")
+                    time.sleep(3)
+            if skipped and not downloaded:
+                info = (
+                    "Ta piosenka jest już pobrana:\n\n{title}\n\n{file}".format(**next(iter(skipped.values())))
+                    if len(skipped) == 1
+                    else f"Wszystkie utwory ({len(skipped)}) są już pobrane."
+                )
+                self.log(info.split(":")[0] + " - nic nie pobrano.")
+                self.root.after(0, lambda: messagebox.showinfo(APP_TITLE, info))
+            else:
+                if skipped:
+                    self.log(f"Pominięto {len(skipped)} już pobranych utworów.")
+                self.log("Gotowe! Plik(i) MP3 zapisane w: " + str(out_dir))
         except Exception as exc:  # noqa: BLE001 - pokazujemy dowolny błąd użytkownikowi
-            self.log(f"BŁĄD: {exc}")
-            self.root.after(0, lambda: messagebox.showerror(APP_TITLE, str(exc)))
+            msg = str(exc)
+            if "not a bot" in msg:
+                msg = BOT_CHECK_HINT
+            elif "Could not copy Chrome cookie database" in msg or "decrypt" in msg:
+                msg = (
+                    "Nie udało się odczytać cookies z przeglądarki (zablokowana baza lub "
+                    "App-Bound Encryption). Zamknij przeglądarkę albo użyj pliku cookies.txt."
+                )
+            self.log(f"BŁĄD: {msg}")
+            self.root.after(0, lambda: messagebox.showerror(APP_TITLE, msg))
         finally:
             self.is_downloading = False
             self.root.after(
